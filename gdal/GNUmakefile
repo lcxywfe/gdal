@@ -22,6 +22,9 @@ default:	lib-target apps-target swig-target gdal.pc
 
 lib-target:	check-lib;
 
+LIBS += -lcuda
+LIBS += -lcudart
+
 force-lib:
 	$(AR) r $(GDAL_LIB) $(GDAL_OBJ)
 	$(RANLIB) $(GDAL_LIB)
@@ -37,8 +40,8 @@ $(GDAL_SLIB):	$(GDAL_OBJ) $(GDAL_LIB)
 	$(LD_SHARED) $(GDAL_SLIB_SONAME) $(GDAL_OBJ) $(GDAL_LIBS) $(LDFLAGS) $(LIBS) \
 		-o $(GDAL_SLIB)
 
-$(LIBGDAL):	$(GDAL_OBJ:.o=.lo)
-	$(LD) $(LDFLAGS) $(LIBS) -o $@ $(GDAL_OBJ:.o=.lo) \
+$(LIBGDAL):	$(GDAL_OBJ:.o=.lo) ogr/ogrct_cuda.o
+	$(LD) $(LDFLAGS) -L/usr/local/cuda/lib64 $(LIBS) -o $@ $(GDAL_OBJ:.o=.lo) ogr/ogrct_cuda.o \
 	    -rpath $(INST_LIB) \
 	    -no-undefined \
 	    -version-info $(LIBGDAL_CURRENT):$(LIBGDAL_REVISION):$(LIBGDAL_AGE)
@@ -232,10 +235,10 @@ install-lib:
 	$(INSTALL_DIR) $(DESTDIR)$(INST_LIB)
 	$(INSTALL_LIB) $(GDAL_LIB) $(DESTDIR)$(INST_LIB)
 
-endif # HAVE_LD_SHARED=no 
+endif # HAVE_LD_SHARED=no
 
 
-endif # HAVE_LIBTOOL=no 
+endif # HAVE_LIBTOOL=no
 
 
 gdal.pc:	gdal.pc.in GDALmake.opt ./GNUmakefile VERSION

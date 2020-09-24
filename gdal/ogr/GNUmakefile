@@ -25,7 +25,7 @@ else
 ZLIB_XTRA_OPT =
 endif
 
-CPPFLAGS	:=	-Iogrsf_frmts -Iogrsf_frmts/mem -I. $(GDAL_INCLUDE) $(PROJ_INCLUDE) $(PROJ_FLAGS) $(CPPFLAGS) $(ZLIB_XTRA_OPT)
+CPPFLAGS	:=	-Iogrsf_frmts -Iogrsf_frmts/mem -I. -I/usr/local/cuda/include $(GDAL_INCLUDE) $(PROJ_INCLUDE) $(PROJ_FLAGS) $(CPPFLAGS) $(ZLIB_XTRA_OPT)
 
 default:	lib
 
@@ -39,7 +39,10 @@ clean:
 very-clean: clean
 	rm -rf html rtf
 
-lib:	sublibs $(OBJ:.o=.$(OBJ_EXT))
+lib:	sublibs $(OBJ:.o=.$(OBJ_EXT)) ogrct_cuda
+
+ogrct_cuda: ogrct_cuda.cu
+	nvcc -std=c++11 -c -gencode arch=compute_61,code=sm_61 -gencode arch=compute_75,code=sm_75 ogrct_cuda.cu -shared -Xcompiler -fPIC -o ogrct_cuda.o
 
 $(OBJ): ogr_feature.h ogr_geometry.h swq.h
 

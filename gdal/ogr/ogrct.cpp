@@ -28,6 +28,7 @@
  * DEALINGS IN THE SOFTWARE.
  ****************************************************************************/
 
+#include <cuda_runtime_api.h>
 #include "ogr_spatialref.h"
 #include "cpl_port.h"
 #include "cpl_error.h"
@@ -65,7 +66,7 @@ static void *hPROJMutex = NULL;
 static projPJ       (*pfn_pj_init_plus)(const char *) = NULL;
 static projPJ       (*pfn_pj_init)(int, char**) = NULL;
 static void     (*pfn_pj_free)(projPJ) = NULL;
-static int      (*pfn_pj_transform)(projPJ, projPJ, long, int, 
+static int      (*pfn_pj_transform)(projPJ, projPJ, long, int,
                                     double *, double *, double * ) = NULL;
 static int         *(*pfn_pj_get_errno_ref)(void) = NULL;
 static char        *(*pfn_pj_strerrno)(int) = NULL;
@@ -149,6 +150,13 @@ class OGRProj4CT : public OGRCoordinateTransformation
     double     *padfTargetY;
     double     *padfTargetZ;
 
+    void* padfOriXDev;
+    void* padfOriYDev;
+    void* padfOriZDev;
+    void* padfTargetXDev;
+    void* padfTargetYDev;
+    void* padfTargetZDev;
+
 public:
                 OGRProj4CT();
     virtual     ~OGRProj4CT();
@@ -161,6 +169,9 @@ public:
     virtual int Transform( int nCount, 
                            double *x, double *y, double *z = NULL );
     virtual int TransformEx( int nCount, 
+                             double *x, double *y, double *z = NULL,
+                             int *panSuccess = NULL );
+    virtual int TransformExCuda( int nCount,
                              double *x, double *y, double *z = NULL,
                              int *panSuccess = NULL );
 
@@ -477,6 +488,12 @@ OGRProj4CT::OGRProj4CT()
     padfTargetX = NULL;
     padfTargetY = NULL;
     padfTargetZ = NULL;
+    padfOriXDev = NULL;
+    padfOriYDev = NULL;
+    padfOriZDev = NULL;
+    padfTargetXDev = NULL;
+    padfTargetYDev = NULL;
+    padfTargetZDev = NULL;
 
     if (pfn_pj_ctx_alloc != NULL)
         pjctx = pfn_pj_ctx_alloc();
@@ -530,6 +547,12 @@ OGRProj4CT::~OGRProj4CT()
     CPLFree(padfTargetX);
     CPLFree(padfTargetY);
     CPLFree(padfTargetZ);
+    if (padfOriXDev) cudaFree(padfOriXDev);
+    if (padfOriYDev) cudaFree(padfOriYDev);
+    if (padfOriZDev) cudaFree(padfOriZDev);
+    if (padfTargetXDev) cudaFree(padfTargetXDev);
+    if (padfTargetYDev) cudaFree(padfTargetYDev);
+    if (padfTargetZDev) cudaFree(padfTargetZDev);
 }
 
 /************************************************************************/
@@ -798,12 +821,34 @@ OGRSpatialReference *OGRProj4CT::GetTargetCS()
 /*      This is a small wrapper for the extended transform version.     */
 /************************************************************************/
 
+namespace cu {
+
+void degree2radian_wrap(const int grid_size, const int block_size,
+                        const int count, double* x, double* y,
+                        const double dfSourceWrapLong);
+void degree2radian(const int grid_size, const int block_size, const int count,
+                   double* x, double* y, const double dfSourceToRadians);
+void check_with_invert(const int grid_size, const int block_size,
+                       const int count, double* x, double* y,
+                       const double* x_ori, const double* y_ori,
+                       const double* x_tar, const double* y_tar,
+                       const double dfThreshold);
+void radian2degree(const int grid_size, const int block_size, const int count,
+                   double* x, double* y, const double dfTargetFromRadians);
+void radian2degree_wrap(const int grid_size, const int block_size,
+                        const int count, double* x, double* y,
+                        const double dfTargetWrapLong);
+void error_info(const int grid_size, const int block_size, const int count,
+                double* x, double* y, int* success);
+
+}  // namespace cu
+
+/*
 int OGRProj4CT::Transform( int nCount, double *x, double *y, double *z )
 
 {
     int *pabSuccess = (int *) CPLMalloc(sizeof(int) * nCount );
     int bOverallSuccess, i;
-
     bOverallSuccess = TransformEx( nCount, x, y, z, pabSuccess );
 
     for( i = 0; i < nCount; i++ )
@@ -814,8 +859,55 @@ int OGRProj4CT::Transform( int nCount, double *x, double *y, double *z )
             break;
         }
     }
-
     CPLFree( pabSuccess );
+    return bOverallSuccess;
+}
+*/
+
+int OGRProj4CT::Transform( int nCount, double *x, double *y, double *z )
+
+{
+    int *pabSuccess = (int *) CPLMalloc(sizeof(int) * nCount );
+    void* pabSuccessDev = NULL;
+    cudaMalloc(&pabSuccessDev, nCount * sizeof(int));
+    int bOverallSuccess;
+
+    void* xDev = NULL;
+    void* yDev = NULL;
+    void* zDev = NULL;
+    cudaMalloc(&xDev, nCount * sizeof(double));
+    cudaMalloc(&yDev, nCount * sizeof(double));
+    cudaMemcpy(xDev, x, nCount * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(yDev, y, nCount * sizeof(double), cudaMemcpyHostToDevice);
+    if (z) {
+        cudaMalloc(&zDev, nCount * sizeof(double));
+        cudaMemcpy(zDev, z, nCount * sizeof(double), cudaMemcpyHostToDevice);
+    }
+
+    bOverallSuccess = TransformExCuda(nCount, static_cast<double*>(xDev),
+                                      static_cast<double*>(yDev),
+                                      static_cast<double*>(zDev),
+                                      static_cast<int*>(pabSuccessDev));
+    cudaMemcpy(pabSuccess, pabSuccessDev, nCount * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    for (int i = 0; i < nCount; i++) {
+        if (!pabSuccess[i]) {
+            bOverallSuccess = FALSE;
+            break;
+        }
+    }
+    CPLFree( pabSuccess );
+
+    cudaMemcpy(x, xDev, nCount * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(y, yDev, nCount * sizeof(double), cudaMemcpyDeviceToHost);
+    if (zDev) {
+        cudaMemcpy(z, zDev, nCount * sizeof(double), cudaMemcpyDeviceToHost);
+    }
+    cudaFree(xDev);
+    cudaFree(yDev);
+    if (zDev) {
+        cudaFree(zDev);
+    }
 
     return bOverallSuccess;
 }
@@ -837,6 +929,171 @@ int CPL_STDCALL OCTTransform( OGRCoordinateTransformationH hTransform,
 /************************************************************************/
 /*                            TransformEx()                             */
 /************************************************************************/
+
+int OGRProj4CT::TransformExCuda(int nCount, double* xDev, double* yDev,
+                                double* zDev, int* pabSuccessDev) {
+    printf("====================gdal cuda==============\n");
+    const int block_size = 256;
+    const int task_per_thread = 8;
+    const int task_per_block = (block_size * task_per_thread);
+    int grid_size = (nCount + task_per_block - 1) / task_per_block;
+
+    int err;
+
+/* -------------------------------------------------------------------- */
+/*      Potentially transform to radians.                               */
+/* -------------------------------------------------------------------- */
+    if (bSourceLatLong) {
+        if (bSourceWrap) {
+            cu::degree2radian_wrap(grid_size, block_size, nCount, xDev, yDev,
+                                   dfSourceWrapLong);
+        }
+        cu::degree2radian(grid_size, block_size, nCount, xDev, yDev,
+                          dfSourceToRadians);
+    }
+
+/* -------------------------------------------------------------------- */
+/*      Do the transformation using PROJ.4.                             */
+/* -------------------------------------------------------------------- */
+    if( !bIdentityTransform && pjctx == NULL )
+    {
+        /* The mutex has already been created */
+        CPLAssert(hPROJMutex != NULL);
+        CPLAcquireMutex(hPROJMutex, 1000.0);
+    }
+
+    if( bIdentityTransform )
+        err = 0;
+    else if (bCheckWithInvertProj)
+    {
+        /* For some projections, we cannot detect if we are trying to reproject */
+        /* coordinates outside the validity area of the projection. So let's do */
+        /* the reverse reprojection and compare with the source coordinates */
+
+        if (nCount > nMaxCount) {
+            nMaxCount = nCount;
+            cudaMalloc(&padfOriXDev, nCount * sizeof(double));
+            cudaMalloc(&padfOriYDev, nCount * sizeof(double));
+            cudaMalloc(&padfTargetXDev, nCount * sizeof(double));
+            cudaMalloc(&padfTargetYDev, nCount * sizeof(double));
+            if (zDev) {
+                cudaMalloc(&padfOriZDev, nCount * sizeof(double));
+                cudaMalloc(&padfTargetZDev, nCount * sizeof(double));
+            }
+        }
+        cudaMemcpy(padfOriXDev, xDev, nCount * sizeof(double),
+                   cudaMemcpyDeviceToDevice);
+        cudaMemcpy(padfOriYDev, yDev, nCount * sizeof(double),
+                   cudaMemcpyDeviceToDevice);
+        if (zDev) {
+            cudaMemcpy(padfOriZDev, zDev, nCount * sizeof(double),
+                       cudaMemcpyDeviceToDevice);
+        }
+        err = pfn_pj_transform(psPJSource, psPJTarget, nCount, 1, xDev, yDev,
+                               zDev);
+        if (err == 0) {
+            cudaMemcpy(padfTargetXDev, xDev, nCount * sizeof(double),
+                       cudaMemcpyDeviceToDevice);
+            cudaMemcpy(padfTargetYDev, yDev, nCount * sizeof(double),
+                       cudaMemcpyDeviceToDevice);
+            if (zDev) {
+                cudaMemcpy(padfTargetZDev, zDev, nCount * sizeof(double),
+                           cudaMemcpyDeviceToDevice);
+            }
+
+            err = pfn_pj_transform(
+                    psPJTarget, psPJSource, nCount, 1,
+                    static_cast<double*>(padfTargetXDev),
+                    static_cast<double*>(padfTargetYDev),
+                    (zDev) ? static_cast<double*>(padfTargetZDev) : NULL);
+
+            if (err == 0) {
+                cu::check_with_invert(
+                        grid_size, block_size, nCount, xDev, yDev,
+                        static_cast<const double*>(padfOriXDev),
+                        static_cast<const double*>(padfOriYDev),
+                        static_cast<const double*>(padfTargetXDev),
+                        static_cast<const double*>(padfTargetYDev),
+                        dfThreshold);
+            }
+        }
+    }
+    else
+    {
+        err = pfn_pj_transform(psPJSource, psPJTarget, nCount, 1, xDev, yDev,
+                               zDev);
+    }
+
+/* -------------------------------------------------------------------- */
+/*      Try to report an error through CPL.  Get proj.4 error string    */
+/*      if possible.  Try to avoid reporting thousands of error         */
+/*      ... supress further error reporting on this OGRProj4CT if we    */
+/*      have already reported 20 errors.                                */
+/* -------------------------------------------------------------------- */
+    if( err != 0 )
+    {
+        if (pabSuccessDev)
+            cudaMemset(pabSuccessDev, 0, sizeof(int) * nCount);
+
+        if (++nErrorCount < 20) {
+            if (pjctx != NULL)
+                /* pfn_pj_strerrno not yet thread-safe in PROJ 4.8.0 */
+                CPLAcquireMutex(hPROJMutex, 1000.0);
+
+            const char *pszError = NULL;
+            if( pfn_pj_strerrno != NULL )
+                pszError = pfn_pj_strerrno( err );
+            
+            if( pszError == NULL )
+                CPLError( CE_Failure, CPLE_AppDefined, 
+                          "Reprojection failed, err = %d", 
+                          err );
+            else
+                CPLError( CE_Failure, CPLE_AppDefined, "%s", pszError );
+
+            if (pjctx != NULL)
+                /* pfn_pj_strerrno not yet thread-safe in PROJ 4.8.0 */
+                CPLReleaseMutex(hPROJMutex);
+        } else if (nErrorCount == 20) {
+            CPLError( CE_Failure, CPLE_AppDefined, 
+                      "Reprojection failed, err = %d, further errors will be supressed on the transform object.", 
+                      err );
+        }
+
+        if (pjctx == NULL)
+            CPLReleaseMutex(hPROJMutex);
+        return FALSE;
+    }
+
+    if( !bIdentityTransform && pjctx == NULL )
+        CPLReleaseMutex(hPROJMutex);
+
+/* -------------------------------------------------------------------- */
+/*      Potentially transform back to degrees.                          */
+/* -------------------------------------------------------------------- */
+    if( bTargetLatLong )
+    {
+        cu::radian2degree(grid_size, block_size, nCount,
+                          static_cast<double*>(xDev),
+                          static_cast<double*>(yDev), dfTargetFromRadians);
+
+        if (bTargetWrap) {
+            cu::radian2degree_wrap(
+                    grid_size, block_size, nCount, static_cast<double*>(xDev),
+                    static_cast<double*>(yDev), dfTargetWrapLong);
+        }
+    }
+
+/* -------------------------------------------------------------------- */
+/*      Establish error information if pabSuccess provided.             */
+/* -------------------------------------------------------------------- */
+    if (pabSuccessDev) {
+        cu::error_info(grid_size, block_size, nCount, xDev, yDev,
+                       pabSuccessDev);
+    }
+
+    return TRUE;
+}
 
 int OGRProj4CT::TransformEx( int nCount, double *x, double *y, double *z,
                              int *pabSuccess )
